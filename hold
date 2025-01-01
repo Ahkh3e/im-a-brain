@@ -1,0 +1,119 @@
+import os
+import cv2
+import time
+import torch
+from langchain_openai import ChatOpenAI
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph import MessagesState
+from langgraph.prebuilt import ToolNode
+from langchain_core.messages import HumanMessage, AIMessage
+import getpass
+
+# Set environment variables
+def _set_env(var: str):
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"{var}: ")
+
+_set_env("OPENAI_API_KEY")
+
+# Initialize ChatOpenAI
+llm = ChatOpenAI(model="gpt-4o")
+CONFIDENCE_THRESHOLD = 0.45
+
+# Load MiDaS for depth estimation
+model_type = "DPT_Large"
+midas = torch.hub.load("intel-isl/MiDaS", model_type)
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+midas.to(device)
+midas.eval()
+
+midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+transform = midas_transforms.dpt_transform if model_type in ["DPT_Large", "DPT_Hybrid"] else midas_transforms.small_transform
+
+# Load YOLO for object detection
+yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s')
+yolo_model.to(device)
+
+# Define Tools
+def detect_objects(state):
+    """
+    Detect objects in the given frame using YOLOv5.
+    """
+    frame = state["frame"]
+    results = yolo_model(frame)
+    return {"detections": results.pandas().xyxy[0].to_dict(orient="records")}
+
+def estimate_depth(state):
+    """
+    Estimate depth for the given frame using MiDaS.
+    """
+    frame = state["frame"]
+    input_batch = transform(frame).to(device)
+    with torch.no_grad():
+        prediction = midas(input_batch)
+        depth_map = prediction.squeeze().cpu().numpy()
+    normalized_depth = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+    return {"depth_map": normalized_depth}
+
+# Build LangGraph
+builder = StateGraph(MessagesState)
+builder.add_node("tool_detect_objects", ToolNode([detect_objects]))
+builder.add_node("tool_estimate_depth", ToolNode([estimate_depth]))
+builder.add_edge(START, "tool_detect_objects")
+builder.add_edge("tool_detect_objects", "tool_estimate_depth")
+builder.add_edge("tool_estimate_depth", END)
+graph = builder.compile()
+
+# Webcam Processing Loop
+cap = cv2.VideoCapture(0)
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
+
+        # Convert frame to RGB
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Prepare messages and state
+        human_message = HumanMessage(content="Analyze this frame for objects and depth.")
+        ai_message = AIMessage(content="Ready to process the frame.")
+        messages = [human_message, ai_message]
+        state = {"messages": messages, "frame": img_rgb}
+
+        # Invoke the graph
+        result_state = graph.invoke(state)
+
+        # Extract results
+        detections = result_state.get("detections", [])
+        depth_map = result_state.get("depth_map", None)
+
+        # Visualize YOLO Results
+        for det in detections:
+            if det['confidence'] > CONFIDENCE_THRESHOLD:
+                x_min, y_min, x_max, y_max = int(det["xmin"]), int(det["ymin"]), int(det["xmax"]), int(det["ymax"])
+                label = f"{det['name']} {det['confidence']:.2f}"
+                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                cv2.putText(frame, label, (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # Display Results
+        cv2.imshow("YOLO Results", frame)
+
+        # Optional: Visualize Depth Map
+        if depth_map is not None:
+            depth_map_colored = (depth_map * 255).astype("uint8")
+            depth_map_colored = cv2.applyColorMap(depth_map_colored, cv2.COLORMAP_JET)
+            cv2.imshow("Depth Map", depth_map_colored)
+
+        # Exit loop on 'q'
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    print("Stream stopped manually")
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
