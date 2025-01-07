@@ -1,135 +1,175 @@
+from unsloth import FastVisionModel, is_bf16_supported
+from unsloth.trainer import UnslothVisionDataCollator
+from trl import SFTTrainer, SFTConfig
+from datasets import Dataset, load_dataset
+import torch
 import os
 import json
 from PIL import Image
 
-# Load class labels from a JSON file
-def load_classes(filepath):
-    with open(filepath, "r") as f:
-        return json.load(f)
+# === Setup Constants ===
+CACHE_DIR = "cache"
+IMAGE_CACHE_DIR = os.path.join(CACHE_DIR, "images")
+JSON_FILE_PATH = os.path.join(CACHE_DIR, "processed_results.json")
+JSON_LINES_FILE = os.path.join(CACHE_DIR, "processed_results.jsonl")
+MODEL_NAME = "unsloth/Llama-3.2-11B-Vision-Instruct-4bit"
+OUTPUT_DIR = "outputs"
+memory_log_count = 0
+# === Load Image Helper ===
+def load_image(image_id, image_dir=IMAGE_CACHE_DIR):
+    image_path = os.path.join(image_dir, f"{image_id}.jpg")
+    if os.path.exists(image_path):
+        return Image.open(image_path).convert("RGB")
+    raise FileNotFoundError(f"Image {image_id} not found in {image_dir}.")
 
-class_labels = load_classes("class_labels.json")
+# === Convert Data to Conversation Format ===
+def convert_to_conversation(sample, image_dir=IMAGE_CACHE_DIR):
+    if 'image_id' not in sample or not sample['image_id']:
+        raise ValueError("Sample missing 'image_id'.")
+    image_path = os.path.join(image_dir, f"{sample['image_id']}.jpg")
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image {sample['image_id']} not found in {image_dir}.")
+    image = Image.open(image_path).convert("RGB")
+    
+    conversation_instance= [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": sample.get("user_instruction", "")},
+                {"type": "image", "image": image}
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": sample.get("assistant_response", "")}]
+        }
+    ]
+    return { "messages" : conversation_instance}
 
-instruction = "You are an expert in object detection. Identify all objects in this image with bounding boxes and descriptions."
+import psutil
+import os
 
-# Convert YOLO format to conversation format
-def convert_yolo_to_conversation(image_dir, label_dir):
-    conversation_data = []
-    for image_file in os.listdir(image_dir):
-        # Handle both PNG and JPG files
-        if not image_file.lower().endswith((".jpg", ".jpeg", ".png")):
-            continue
+def log_memory_usage(step):
+    global memory_log_count
+    memory_log_count += 1
+    process = psutil.Process(os.getpid())
+    memory = process.memory_info().rss / (1024 * 1024)  # Memory in MB
+    print(f"Step {step}: Memory usage is {memory:.2f} MB - {memory_log_count}")
+# === Process Dataset ===
+def process_dataset(json_file_path,max_images, image_dir=IMAGE_CACHE_DIR ):
+    with open(json_file_path, "r") as f:
+        raw_data = json.load(f)
+    limited_data = list(raw_data.items())[:max_images]
+    processed_conversations = []
+    conversation = [convert_to_conversation(sample, image_dir=image_dir)for example_id, sample in limited_data]
+    return conversation
 
-        label_file = os.path.join(label_dir, image_file.replace(".png", ".txt").replace(".jpg", ".txt"))
-        image_path = os.path.join(image_dir, image_file)
+# === Save Dataset as JSON Lines ===
+def save_as_json_lines(data, output_file):
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w") as f:
+        for record in data:
+            f.write(json.dumps(record) + "\n")
+    print(f"Saved dataset to {output_file} as JSON Lines.")
 
-        annotations = []
-        if os.path.exists(label_file):
-            with open(label_file, "r") as f:
-                for line in f.readlines():
-                    class_id, x_center, y_center, width, height = map(float, line.strip().split())
-                    class_name = class_labels.get(str(int(class_id)), "unknown")
-                    annotations.append(f"{class_name} at x_center={x_center}, y_center={y_center}, width={width}, height={height}.")
+# === Main Script ===
+print("Processing dataset...")
+max_images=100
+processed_conversations = process_dataset(JSON_FILE_PATH,max_images, IMAGE_CACHE_DIR)
 
-        messages = [
-            {"role": "user", "content": [{"type": "text", "text": instruction}, {"type": "image", "image": Image.open(image_path)}]},
-            {"role": "assistant", "content": [{"type": "text", "text": " ".join(annotations)}]},
-        ]
-        conversation_data.append({"messages": messages})
-    return conversation_data
-
-# Prepare train and validation datasets
-train_data = convert_yolo_to_conversation("Custom_Data/images/train", "Custom_Data/labels/train")
-val_data = convert_yolo_to_conversation("Custom_Data/images/val", "Custom_Data/labels/val")
-
-
-
-
+#print("Saving dataset as JSON Lines...")
+#save_as_json_lines(processed_conversations, JSON_LINES_FILE)
 
 
-from unsloth import FastVisionModel
-import torch
-from trl import SFTTrainer, SFTConfig
-from unsloth.trainer import UnslothVisionDataCollator
 
-# 4bit pre quantized models we support for 4x faster downloading + no OOMs.
-fourbit_models = [
-    "unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit", # Llama 3.2 vision support
-    "unsloth/Llama-3.2-11B-Vision-bnb-4bit",
-    "unsloth/Llama-3.2-90B-Vision-Instruct-bnb-4bit", # Can fit in a 80GB card!
-    "unsloth/Llama-3.2-90B-Vision-bnb-4bit",
+def check_for_none(data):
+    if data is None:
+        return True
+    if isinstance(data, dict):
+        return any(check_for_none(v) for v in data.values())
+    if isinstance(data, list):
+        return any(check_for_none(v) for v in data)
+    return False
 
-    "unsloth/Pixtral-12B-2409-bnb-4bit",              # Pixtral fits in 16GB!
-    "unsloth/Pixtral-12B-Base-2409-bnb-4bit",         # Pixtral base model
+# Check the data for any NoneType values
+# print("Converting to Hugging Face Dataset...")
+# hf_dataset = Dataset.from_list(processed_conversations)
+# contains_none = check_for_none(hf_dataset)
+# print(f"Does the data contain NoneType values? {contains_none}")
+# print("Created dataset")
+# Split into training and validation sets
+# Split into training and validation sets
 
-    "unsloth/Qwen2-VL-2B-Instruct-bnb-4bit",          # Qwen2 VL support
-    "unsloth/Qwen2-VL-7B-Instruct-bnb-4bit",
-    "unsloth/Qwen2-VL-72B-Instruct-bnb-4bit",
-
-    "unsloth/llava-v1.6-mistral-7b-hf-bnb-4bit",      # Any Llava variant works!
-    "unsloth/llava-1.5-7b-hf-bnb-4bit",
-] # More models at https://huggingface.co/unsloth
-
+# === Load and Prepare Model ===
+print("Loading model...")
 model, tokenizer = FastVisionModel.from_pretrained(
-    model_name= "unsloth/Llama-3.2-11B-Vision-Instruct",
-    load_in_4bit = True, # Use 4bit to reduce memory use. False for 16bit LoRA.
-    use_gradient_checkpointing = "unsloth", # True or "unsloth" for long context
+    model_name=MODEL_NAME,
+    load_in_4bit=True,
+    use_gradient_checkpointing="unsloth"
 )
 
 model = FastVisionModel.get_peft_model(
     model,
-    finetune_vision_layers     = True, # False if not finetuning vision layers
-    finetune_language_layers   = True, # False if not finetuning language layers
-    finetune_attention_modules = True, # False if not finetuning attention layers
-    finetune_mlp_modules       = True, # False if not finetuning MLP layers
-
-    r = 16,           # The larger, the higher the accuracy, but might overfit
-    lora_alpha = 16,  # Recommended alpha == r at least
-    lora_dropout = 0,
-    bias = "none",
-    random_state = 3407,
-    use_rslora = False,  # We support rank stabilized LoRA
-    loftq_config = None, # And LoftQ
-    # target_modules = "all-linear", # Optional now! Can specify a list if needed
+    finetune_vision_layers=True,
+    finetune_language_layers=True,
+    finetune_attention_modules=True,
+    finetune_mlp_modules=True,
+    r=16,
+    lora_alpha=16,
+    lora_dropout=0,
+    bias="none",
+    random_state=3407,
+    use_rslora=False,
+    loftq_config = None
 )
 
-
-FastVisionModel.for_training(model)
-
+# === Configure Trainer ===
+print("Configuring trainer...")
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
     data_collator=UnslothVisionDataCollator(model, tokenizer),
-    train_dataset=train_data,
-    eval_dataset=val_data,
+    train_dataset=processed_conversations,
     args=SFTConfig(
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
         warmup_steps=5,
-        max_steps=30,  # Set `num_train_epochs` for full training
+        num_train_epochs=1,
         learning_rate=2e-4,
-        fp16=True,
+        fp16=not is_bf16_supported(),
+        bf16=is_bf16_supported(),
         logging_steps=1,
         optim="adamw_8bit",
         weight_decay=0.01,
         lr_scheduler_type="linear",
         seed=3407,
-        output_dir="outputs",
+        output_dir=OUTPUT_DIR,
+        report_to = "none",
         remove_unused_columns=False,
+        dataset_text_field="",
+        dataset_kwargs={"skip_prepare_dataset": True},
+        dataset_num_proc=4,
         max_seq_length=2048,
     ),
 )
 
-#@title Show current memory stats
+# === Train Model ===
+print("Starting training...")
 gpu_stats = torch.cuda.get_device_properties(0)
 start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
 max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
+torch.cuda.empty_cache()
+torch.cuda.reset_max_memory_allocated()
+import gc
+
+gc.collect()
+
+torch.cuda.empty_cache()
 print(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB.")
 print(f"{start_gpu_memory} GB of memory reserved.")
-
-# Train the model
+print(torch.cuda.memory_summary(device=None, abbreviated=False))
 trainer_stats = trainer.train()
-
-
+print(f"Training runtime: {trainer_stats.metrics['train_runtime']} seconds.")
 used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
 used_memory_for_lora = round(used_memory - start_gpu_memory, 3)
 used_percentage = round(used_memory         /max_memory*100, 3)
@@ -140,16 +180,10 @@ print(f"Peak reserved memory = {used_memory} GB.")
 print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
 print(f"Peak reserved memory % of max memory = {used_percentage} %.")
 print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.")
+# === Save Model ===
+print("Saving model...")
+model.save_pretrained("/content/fine_tuned_model")
+tokenizer.save_pretrained("/content/fine_tuned_model")
 
-# Save the fine-tuned model in GGUF format
-model.save_pretrained_gguf(
-    save_directory="model",
-    tokenizer=tokenizer,
-    quantization_method="f16"  # Quantize weights to float16 for efficiency
-)
-
-# Save the fine-tuned model
-model.save_pretrained("fine_tuned_model")
-tokenizer.save_pretrained("fine_tuned_model")
-
-print("Model and tokenizer saved to 'fine_tuned_model' directory.")
+model.save_pretrained_gguf("/content/fine_tuned_gguf", tokenizer, quantization_method="f16")
+print("Training completed and model saved!")
